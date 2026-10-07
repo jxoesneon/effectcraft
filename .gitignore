@@ -1,7 +1,9 @@
-*~
-plan/
 target/
-/dist
-/log
+Cargo.lock
+**/*.rs.bk
+*.swp
 .DS_Store
-.claude/worktrees/
+
+# Demonstration artifacts
+/brag/
+brag/
