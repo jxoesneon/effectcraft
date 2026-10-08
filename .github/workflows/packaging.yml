@@ -14,7 +14,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-aiohttp python3-toml curl
+          sudo apt-get install -y curl python3-pip
+          pip3 install aiohttp tomlkit --break-system-packages || pip3 install aiohttp tomlkit
       - name: Vendor Cargo sources
         run: |
           curl -fsSLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
