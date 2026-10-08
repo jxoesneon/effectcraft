@@ -37,6 +37,7 @@ modules:
     build-commands:
       - cargo --offline build --release --locked -p effectcraft
       - install -Dm755 target/release/effectcraft /app/bin/effectcraft
+      - install -d /app/share/applications
       - sed -e 's/ai\.storyteller\.effectcraft/org.artcraft.app/g' packaging/linux/ai.storyteller.effectcraft.desktop > /app/share/applications/org.artcraft.app.desktop
       - install -Dm644 packaging/linux/ai.storyteller.effectcraft.mime.xml /app/share/mime/packages/org.artcraft.app.xml
       - mkdir -p /app/share/icons && cp -R assets/app-icon/hicolor /app/share/icons/ && find /app/share/icons -type f -name 'ai.storyteller.effectcraft.*' | while read f; do mv "$f" "$(echo "$f" | sed 's/ai.storyteller.effectcraft/org.artcraft.app/')"; done
