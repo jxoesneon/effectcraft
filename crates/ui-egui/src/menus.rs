@@ -173,7 +173,8 @@ pub fn reveal(app: &mut EffectcraftApp, kind: &str, now: f64, add: bool) {
     } else {
         kinds = vec![kind.to_string()];
     }
-    tl.apply_reveal(&targets, kinds);
+    tl.apply_reveal(&targets, kinds.clone());
+    crate::panels::timeline::open_revealed(app, &targets, &kinds);
 }
 
 /// Show Time Remap on the layers of a `layer.enableTimeRemap` (`layers` by id, else the
@@ -1073,6 +1074,10 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
             if !shown.is_empty() {
                 tl.apply_reveal(&shown, vec!["props".into()]);
             }
+            // Properties inside effects (puppet pins…) show under their effect, twirled open.
+            for (layer, prop) in props.iter().filter_map(|x| Some((x.get("layer")?.as_u64()?, x.get("prop")?.as_u64()?))) {
+                crate::panels::timeline::open_effect_paths(app, layer, &[prop]);
+            }
             json!({"revealed": found.len()})
         }
         _ => return Err(format!("`{id}` is not a frontend command")),
@@ -1153,6 +1158,10 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
     };
     let Some(v) = picked else { return Some(Ok(Value::Null)) };
     p.insert(key.to_string(), v);
+    // Picked files import in the background, with the Importing card showing progress (#270).
+    if matches!(id, "file.import" | "file.importMultiple") {
+        p.insert("background".into(), Value::Bool(true));
+    }
     // Photoshop files ask how to import them first.
     if id == "file.import" && crate::panels::dialogs::open_form(app, id, &Value::Object(p.clone())) {
         return Some(Ok(json!({"dialog": id})));
@@ -1537,7 +1546,7 @@ pub fn menu_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
                 if let MenuNode::Submenu { label, children } = node {
                     let r = ui.menu_button(crate::i18n::label(app, "", label), |ui| {
                         ui.set_min_width(if label == "Effect" { 200.0 } else { 280.0 });
-                        menu_nodes(app, ui, children, &mut clicked);
+                        crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, &mut clicked));
                     });
                     app.auto.add(&format!("menu.{label}"), r.response.rect, label);
                 }
@@ -1604,12 +1613,7 @@ fn menu_nodes(app: &mut EffectcraftApp, ui: &mut egui::Ui, nodes: &[MenuNode], c
                 let shown = crate::i18n::submenu(app, label, effectcraft_engine::menus::submenu_label(&app.session, label, &dyn_ctx(&ws, &[])));
                 ui.menu_button((gutter(false), shown.as_str()), |ui| {
                     ui.set_min_width(if children.len() > 30 { 200.0 } else { 240.0 });
-                    // Long submenus (Blending Mode, effect categories) scroll instead of running
-                    // off the screen. Others show whole: egui sizes a new submenu from a default
-                    // 400 pt area, so without a minimum a longer one (Window ▸ Workspace) got
-                    // stuck at that height with its last entries scrolled out of view (#191).
-                    let max_h = ui.ctx().content_rect().height() - 40.0;
-                    egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).show(ui, |ui| menu_nodes(app, ui, children, clicked));
+                    crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, clicked));
                 });
             }
             MenuNode::Item(e) => {

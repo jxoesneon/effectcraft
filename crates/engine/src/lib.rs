@@ -15,6 +15,7 @@ pub mod camera_track;
 pub mod commands;
 pub mod config;
 pub mod demo;
+pub mod ease_presets;
 pub mod footage_check;
 pub mod guard;
 pub mod history;
@@ -224,6 +225,9 @@ pub struct EditorState {
     #[serde(default)]
     pub selected_vertices: Vec<VertexRef>,
     pub snapping: bool,
+    /// Tools bar ▸ Snapping options (which features snap, Snap Edges Extended).
+    #[serde(default)]
+    pub snap_features: viewer::SnapFeatures,
     /// Last applied effect id (Effect ▸ last effect).
     pub last_effect: Option<String>,
     /// Viewer region of interest `[x, y, w, h]` in comp pixels (Composition ▸ Crop Comp to Region
@@ -358,6 +362,9 @@ pub struct Session {
     /// that ask for [`effectcraft_render::Backend::Gpu`]/`Auto`, and by Render Queue exports
     /// when the project's renderer is the GPU.
     pub accel: Option<Arc<dyn effectcraft_render::Accelerator>>,
+    /// Why there is no [`Session::accel`] (`render.backend`'s `why`): the host's reason, e.g. a
+    /// headless start without `--gpu` or the compositor's setup error.
+    pub accel_note: Option<String>,
     /// Expression syntax checker (set by the host that links the expression engine).
     pub expr_check: Option<fn(&str) -> std::result::Result<(), String>>,
     pub importer: Option<Arc<dyn Importer>>,
@@ -403,6 +410,8 @@ pub struct Session {
     pub config: Option<Arc<dyn config::ConfigStore>>,
     /// Keyboard shortcut presets.
     pub keymaps: shortcuts::Keymaps,
+    /// User ease presets (Window ▸ Ease Presets; the built-in ones are in [`ease_presets`]).
+    pub ease_presets: Vec<ease_presets::EasePreset>,
     /// Frontend-only commands offered for binding.
     pub ui_commands: Vec<shortcuts::UiCommand>,
     /// Cache of the resolved active preset (read it with [`Session::shortcuts`]).
@@ -489,6 +498,7 @@ impl Default for Session {
             footage: Arc::new(NoFootage),
             expr: None,
             accel: None,
+            accel_note: None,
             expr_check: None,
             importer: None,
             exporter: None,
@@ -512,6 +522,7 @@ impl Default for Session {
             prefs_revision: 0,
             config: None,
             keymaps: shortcuts::Keymaps::default(),
+            ease_presets: vec![],
             ui_commands: vec![],
             shortcut_table: std::sync::OnceLock::new(),
             autosave: autosave::AutoSaveState::default(),
@@ -981,6 +992,8 @@ mod tests_codec_options;
 mod tests_color_view;
 #[cfg(test)]
 mod tests_disk_cache;
+#[cfg(test)]
+mod tests_ease_presets;
 #[cfg(test)]
 mod tests_effects;
 #[cfg(test)]

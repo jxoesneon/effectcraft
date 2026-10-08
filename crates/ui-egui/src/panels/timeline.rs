@@ -330,6 +330,18 @@ fn snap_candidates(comp: &Comp, rows: &[Row]) -> Vec<f64> {
     v
 }
 
+/// Shift-dragging the work area or one of its ends (#252): the correction (seconds) that puts
+/// the nearest of the `moving` times on the current time, a key, a layer in / out point or a
+/// marker within 8 px (the work area's own ends are no targets).
+fn work_area_snap(app: &EffectcraftApp, comp: &Comp, moving: &[f64], pps: f64) -> f64 {
+    let (a, b) = (comp.work_area.0.seconds(), comp.work_area.1.seconds());
+    let mut cands = snap_candidates(comp, &build_rows(app, comp));
+    cands.retain(|c| (c - a).abs() > 1e-9 && (c - b).abs() > 1e-9);
+    cands.push(app.session.time().seconds());
+    let tol = 8.0 / pps.max(1e-6);
+    moving.iter().map(|t| snap_time(&cands, *t, tol) - t).filter(|d| *d != 0.0).min_by(|x, y| x.abs().total_cmp(&y.abs())).unwrap_or(0.0)
+}
+
 /// Timeline horizontal mapping.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TMap {
@@ -673,8 +685,11 @@ fn build_rows(app: &EffectcraftApp, comp: &Comp) -> Vec<Row> {
 fn reveal_rows(app: &EffectcraftApp, l: &Layer, kinds: &[String], rows: &mut Vec<Row>) {
     let tl = &app.ui.timeline;
     let has = |k: &str| kinds.iter().any(|r| r == k);
-    let group_rows = |rows: &mut Vec<Row>, g: &PropGroup, fx: bool| {
+    // Groups shown with their whole contents: the revealed properties inside aren't listed again.
+    let mut shown_groups: Vec<u64> = vec![];
+    let mut group_rows = |rows: &mut Vec<Row>, g: &PropGroup, fx: bool| {
         for g in g.groups() {
+            shown_groups.push(g.uid);
             rows.push(Row {
                 layer: l.id,
                 depth: 1,
@@ -739,11 +754,6 @@ fn reveal_rows(app: &EffectcraftApp, l: &Layer, kinds: &[String], rows: &mut Vec
             wanted.extend(found);
         }
     }
-    if !wanted.is_empty() {
-        let mut found = vec![];
-        collect_props(&l.props, &mut found, &|p| wanted.contains(&p.uid));
-        rows.extend(found.into_iter().map(|uid| Row { layer: l.id, depth: 1, kind: RowKind::Prop { uid } }));
-    }
     // SS: the selected properties and groups (as Animation ▸ Reveal Properties shows them).
     let selected: std::collections::BTreeSet<u64> = app.session.state.selected_props.iter().filter(|(lid, _)| *lid == l.id).map(|(_, u)| *u).collect();
     if has("props") || has("selected") {
@@ -772,17 +782,124 @@ fn reveal_rows(app: &EffectcraftApp, l: &Layer, kinds: &[String], rows: &mut Vec
             if open {
                 push_group(rows, l, g, 2, &tl.open_groups);
             }
+            shown_groups.push(g.uid);
         }
-        let mut found = vec![];
-        collect_props(&l.props, &mut found, &|p| prop_visible(p, l) && reveal_props.contains(&p.uid) && !wanted.contains(&p.uid));
-        rows.extend(found.into_iter().map(|uid| Row { layer: l.id, depth: 1, kind: RowKind::Prop { uid } }));
+        wanted.extend(picked.iter().copied());
     }
+    revealed_rows(rows, l, &wanted, &shown_groups, &tl.open_groups);
     if has("waveform")
         && let Some(item) = super::waveform::audio_item(&app.session.project, l)
     {
         rows.push(Row { layer: l.id, depth: 1, kind: RowKind::Waveform { item: item.0 } });
     }
 }
+
+/// Rows for the revealed properties `shown` of `l`, in tree order. Those inside an effect show
+/// under the effect and its groups, as in After Effects (Puppet ▸ Mesh 1 ▸ Deform ▸ Puppet
+/// Pin 1 ▸ Position: every pin's Position is told apart, #273); the others (Transform, masks…)
+/// on their own. Groups in `skip` already show with their contents.
+fn revealed_rows(rows: &mut Vec<Row>, l: &Layer, shown: &std::collections::BTreeSet<u64>, skip: &[u64], open: &std::collections::BTreeSet<u64>) {
+    struct Tree<'a> {
+        l: &'a Layer,
+        wanted: &'a dyn Fn(&Property) -> bool,
+        skip: &'a [u64],
+        open: &'a std::collections::BTreeSet<u64>,
+    }
+    fn holds(g: &PropGroup, wanted: &dyn Fn(&Property) -> bool) -> bool {
+        g.children.iter().any(|c| match c {
+            Node::Prop(p) => wanted(p),
+            Node::Group(sg) => holds(sg, wanted),
+        })
+    }
+    // A group holding revealed properties (twirled as the user left it), then those inside.
+    fn group(rows: &mut Vec<Row>, t: &Tree<'_>, g: &PropGroup, depth: usize) {
+        if t.skip.contains(&g.uid) || !holds(g, t.wanted) {
+            return;
+        }
+        let o = t.open.contains(&g.uid);
+        let fx = matches!(g.kind, GroupKind::Effect { .. }).then_some(g.enabled);
+        rows.push(Row { layer: t.l.id, depth, kind: RowKind::Group { uid: g.uid, name: g.name.clone(), open: o, has_children: true, fx, eye: None } });
+        if !o {
+            return;
+        }
+        for c in &g.children {
+            match c {
+                Node::Prop(p) if (t.wanted)(p) => rows.push(Row { layer: t.l.id, depth: depth + 1, kind: RowKind::Prop { uid: p.uid } }),
+                Node::Group(sg) => group(rows, t, sg, depth + 1),
+                Node::Prop(_) => {}
+            }
+        }
+    }
+    let wanted = |p: &Property| shown.contains(&p.uid) && prop_visible(p, l);
+    let tree = Tree { l, wanted: &wanted, skip, open };
+    for c in &l.props.children {
+        match c {
+            Node::Group(fx) if fx.match_id == "effects" => {
+                for e in fx.groups() {
+                    group(rows, &tree, e, 1);
+                }
+            }
+            Node::Group(g) => {
+                let mut found = vec![];
+                collect_props(g, &mut found, &wanted);
+                rows.extend(found.into_iter().map(|uid| Row { layer: l.id, depth: 1, kind: RowKind::Prop { uid } }));
+            }
+            Node::Prop(p) if wanted(p) => rows.push(Row { layer: l.id, depth: 1, kind: RowKind::Prop { uid: p.uid } }),
+            Node::Prop(_) => {}
+        }
+    }
+}
+
+/// Uids of the groups that hold property `uid` of `l`, outermost first.
+fn enclosing_groups(l: &Layer, uid: u64) -> Vec<u64> {
+    let path = l.props.path_of(uid).unwrap_or_default();
+    let mut ids: Vec<u64> = path.split('/').filter_map(|s| s.strip_prefix('@')?.parse().ok()).collect();
+    ids.pop();
+    ids
+}
+
+/// Twirl open the groups holding `props` of `layer` that sit inside effects, so their rows show
+/// (a U reveal, an EE reveal, a puppet pin placed or moved in the viewer).
+pub(crate) fn open_effect_paths(app: &mut EffectcraftApp, layer: u64, props: &[u64]) {
+    let Some(l) = app.session.active_comp().and_then(|c| c.layer(LayerId(layer))) else { return };
+    let Some(fx) = l.effects().map(|g| g.uid) else { return };
+    let mut open = vec![];
+    for p in props {
+        let path = enclosing_groups(l, *p);
+        if path.first() == Some(&fx) {
+            open.extend(path);
+        }
+    }
+    app.ui.timeline.open_groups.extend(open);
+}
+
+/// After a reveal shortcut that picks properties by state (EE expressions): those inside effects
+/// on `layers` show under their effect, twirled open.
+pub(crate) fn open_revealed(app: &mut EffectcraftApp, layers: &[u64], kinds: &[String]) {
+    for kind in kinds.iter().filter(|k| matches!(k.as_str(), "animated" | "expressions")) {
+        for id in layers {
+            let Some(l) = app.session.active_comp().and_then(|c| c.layer(LayerId(*id))) else { continue };
+            let mut found = vec![];
+            collect_props(&l.props, &mut found, &|p| prop_visible(p, l) && reveal_matches(p, &[], kind));
+            open_effect_paths(app, *id, &found);
+        }
+    }
+}
+
+/// After the viewer edits a property (a puppet pin placed, moved or recorded): when `layer` is
+/// twirled open, its groups open, and a U reveal of the layer takes it in, so its keyframes show
+/// (#273). A collapsed layer stays collapsed, as in After Effects.
+pub fn keep_in_view(app: &mut EffectcraftApp, layer: LayerId, prop: u64) {
+    if !app.ui.timeline.open_layers.contains(&layer.0) {
+        return;
+    }
+    open_effect_paths(app, layer.0, &[prop]);
+    let tl = &mut app.ui.timeline;
+    if tl.layer_reveal.get(&layer.0).is_some_and(|k| k.iter().any(|k| k == "props")) {
+        tl.reveal_props.insert(prop);
+    }
+}
+
 fn collect_props(g: &PropGroup, out: &mut Vec<u64>, f: &dyn Fn(&Property) -> bool) {
     for c in &g.children {
         match c {
@@ -1079,10 +1196,31 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     p.rect_filled(ruler, 0.0, t.tl_ruler_bg);
     app.auto.add("timeline.ruler", ruler, &format!("{},{}", tm.start, tm.pps));
     // Work area bar: below the ruler, beside the column headers (After Effects' layout), with
-    // blue begin / end handles; the cache bar runs under it.
+    // blue begin / end handles; the cache bar runs under it. Dragging the bar moves the work
+    // area, the handles move its ends; Shift snaps (#252).
     let wa_row = Rect::from_min_max(pos2(graph_x0, top + header_h), pos2(rect.max.x, top + header_h + colhdr_h));
-    let wa = Rect::from_min_max(pos2(tm.x(comp.work_area.0.seconds()), wa_row.min.y + 3.0), pos2(tm.x(comp.work_area.1.seconds()), wa_row.max.y - 6.0));
+    let (wa0, wa1) = (comp.work_area.0.seconds(), comp.work_area.1.seconds());
+    let wa = Rect::from_min_max(pos2(tm.x(wa0), wa_row.min.y + 3.0), pos2(tm.x(wa1), wa_row.max.y - 6.0));
     p.with_clip_rect(wa_row).rect_filled(wa, 0.0, WORK_AREA_BAR);
+    let shift = ui.input(|i| i.modifiers.shift);
+    let bar = wa.intersect(wa_row);
+    let bresp = ui.interact(bar, egui::Id::new("wa-bar"), Sense::drag());
+    app.auto.add("timeline.workArea.bar", bar, "Work area");
+    let bar_start = egui::Id::new("wa-bar-start");
+    if bresp.drag_started() {
+        ctx.data_mut(|d| d.insert_temp(bar_start, wa0));
+    }
+    if bresp.dragged()
+        && let (Some(a0), Some(d)) = (ctx.data(|d| d.get_temp::<f64>(bar_start)), bresp.total_drag_delta())
+    {
+        let len = wa1 - wa0;
+        let mut a = a0 + d.x as f64 / pps.max(1e-6);
+        if shift {
+            a += work_area_snap(app, &comp, &[a, a + len], pps);
+        }
+        let a = fr.snap_nearest(Tick::from_seconds_f64(a.clamp(0.0, (comp.duration.seconds() - len).max(0.0)))).seconds();
+        let _ = app.session.execute("comp.workArea", json!({"start": a, "end": a + len, "merge": "wa-drag"}));
+    }
     for (hx, set) in [(wa.min.x, "begin"), (wa.max.x, "end")] {
         let hr = Rect::from_center_size(pos2(hx, wa.center().y), vec2(8.0, 14.0));
         let handle = if set == "begin" {
@@ -1096,7 +1234,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if resp.dragged()
             && let Some(pt) = resp.interact_pointer_pos()
         {
-            let secs = fr.snap_nearest(Tick::from_seconds_f64(tm.t(pt.x).max(0.0))).seconds();
+            let mut secs = tm.t(pt.x).max(0.0);
+            if shift {
+                secs += work_area_snap(app, &comp, &[secs], pps);
+            }
+            let secs = fr.snap_nearest(Tick::from_seconds_f64(secs)).seconds();
             let key = if set == "begin" { "start" } else { "end" };
             let _ = app.session.execute("comp.workArea", json!({key: secs, "merge": "wa-drag"}));
         }
@@ -1897,12 +2039,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 egui::Popup::menu(&lang).show(|ui| {
                     for (cat, items) in effectcraft_engine::commands::expr_tools::language_menu() {
                         ui.menu_button(cat, |ui| {
-                            for (label, text) in items {
-                                if ui.button(label).clicked() {
-                                    picked = Some(text);
-                                    ui.close();
+                            widgets::menu_scroll(ui, |ui| {
+                                for (label, text) in items {
+                                    if ui.button(label).clicked() {
+                                        picked = Some(text);
+                                        ui.close();
+                                    }
                                 }
-                            }
+                            })
                         });
                     }
                 });
@@ -2094,7 +2238,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         let kresp = ui.interact(kr, egui::Id::new(("key", uid, k.time.0)), Sense::click_and_drag());
                         app.auto.add(&format!("timeline.key.{uid}.{}", fr.frame_at(ct)), kr, &format!("{} key", prop.name));
                         let mods = ui.input(|i| i.modifiers);
-                        let this_key = json!({"keys": [{"layer": layer.id.0, "prop": uid, "time": k.time.seconds()}]});
+                        let this_key = json!({"keys": [{"layer": layer.id.0, "prop": uid, "time": k.time.seconds()}], "selectProperties": true});
                         if kresp.clicked() && mods.command {
                             // Ctrl+click: Linear ↔ Auto Bezier; Ctrl+Alt+click: Hold on / off.
                             actions.push(("keys.select".into(), this_key.clone()));
@@ -2375,7 +2519,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
             }
         }
-        actions.push(("keys.select".into(), json!({"keys": keys, "add": ui.input(|i| i.modifiers.shift)})));
+        actions.push(("keys.select".into(), json!({"keys": keys, "add": ui.input(|i| i.modifiers.shift), "selectProperties": true})));
     }
 
     // CTI.
@@ -2401,18 +2545,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if overflow > 0.0 {
         // Outline scroll bar along the top of the footer, under the columns.
         let track = Rect::from_min_max(pos2(rect.min.x + 2.0, footer.min.y + 1.0), pos2(graph_x0 - 3.0, footer.min.y + 5.0));
-        let frac = left_w / natural_w;
-        let tw = (track.width() * frac).max(20.0);
-        let tx = track.min.x + (track.width() - tw) * (oscroll / overflow);
-        let thumb = Rect::from_min_size(pos2(tx, track.min.y), vec2(tw, track.height()));
-        p.rect_filled(track, 2.0, t.field_bg);
-        let sresp = ui.interact(track.expand2(vec2(0.0, 2.0)), egui::Id::new("tl-outline-scroll"), Sense::drag());
-        p.rect_filled(thumb, 2.0, if sresp.dragged() || sresp.hovered() { t.text_dim } else { t.text_faint });
-        app.auto.add("timeline.outlineScroll", track, &format!("{oscroll}/{overflow}"));
-        if sresp.dragged() {
-            let k = overflow / (track.width() - tw).max(1.0);
-            app.ui.timeline.outline_scroll = (oscroll + sresp.drag_delta().x * k).clamp(0.0, overflow);
-        }
+        app.ui.timeline.outline_scroll = widgets::scroll_bar(ui, &mut app.auto, "timeline.outlineScroll", track, oscroll, overflow, &t);
+    }
+    if max_scroll > 0.0 {
+        // The layer rows' scroll bar, on the right edge beside the time graph.
+        let track = Rect::from_min_max(pos2(rect.max.x - 6.0, rows_rect.min.y + 1.0), pos2(rect.max.x - 2.0, rows_rect.max.y - 1.0));
+        app.ui.timeline.scroll_y = widgets::scroll_bar(ui, &mut app.auto, "timeline.scroll", track, app.ui.timeline.scroll_y, max_scroll, &t);
     }
     let tgl = Rect::from_min_size(pos2(footer.min.x + 10.0, footer.min.y + 3.0), vec2(150.0, 18.0));
     let tresp = ui.interact(tgl, egui::Id::new("tl-toggle-modes"), Sense::click());
@@ -2921,12 +3059,14 @@ pub(crate) fn layer_menu(ui: &mut egui::Ui, layers: &[u64], actions: &mut Vec<(S
         item(ui, "Freeze on Last Frame", "layer.freezeOnLastFrame", json!({"layers": layers}));
     });
     ui.menu_button("Blending Mode", |ui| {
-        for m in BlendMode::ALL {
-            item(ui, m.label(), "layer.setBlendMode", json!({"layers": layers, "mode": m.label()}));
-            if m.ends_group() {
-                ui.separator();
+        widgets::menu_scroll(ui, |ui| {
+            for m in BlendMode::ALL {
+                item(ui, m.label(), "layer.setBlendMode", json!({"layers": layers, "mode": m.label()}));
+                if m.ends_group() {
+                    ui.separator();
+                }
             }
-        }
+        })
     });
     ui.menu_button("Arrange", |ui| {
         item(ui, "Bring Layer to Front", "layer.arrange", json!({"layers": layers, "to": "front"}));

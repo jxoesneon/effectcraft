@@ -383,16 +383,21 @@ impl EffectcraftApp {
     }
 
     pub fn set_workspace(&mut self, name: &str) {
-        self.ui.workspace = name.to_string();
-        self.ui.dock = self.ui.saved_workspaces.get(name).cloned().unwrap_or_else(|| dock::workspace(name));
-        self.ui.floating = self.ui.saved_floating.get(name).cloned().unwrap_or_else(|| dock::workspace_floating(name));
-        self.ui.maximized = None;
-        // Learn: the Home screen's Learn tab (tutorials) in the Composition panel.
+        // Learn: the Home screen's Learn tab (tutorials) in the Composition panel. Leaving it for
+        // another workspace closes the Home screen again: it stayed over every workspace until a
+        // project was created (#272).
         if name == "Learn" {
             self.ui.start_screen = true;
             self.ui.home_learn = true;
             self.ui.home_templates = false;
+        } else if self.ui.workspace == "Learn" {
+            self.ui.start_screen = false;
+            self.ui.home_learn = false;
         }
+        self.ui.workspace = name.to_string();
+        self.ui.dock = self.ui.saved_workspaces.get(name).cloned().unwrap_or_else(|| dock::workspace(name));
+        self.ui.floating = self.ui.saved_floating.get(name).cloned().unwrap_or_else(|| dock::workspace_floating(name));
+        self.ui.maximized = None;
     }
 
     /// Built-in workspaces followed by the saved ones (Window ▸ Workspace ▸ Save as New Workspace).
@@ -503,6 +508,7 @@ impl EffectcraftApp {
         self.gpu_checked = true;
         self.frames.retire_gpu();
         self.session.accel = None;
+        self.session.accel_note = Some(format!("GPU preview retired: {}", failure.reason));
         self.session.layer_cache.clear();
         self.gpu = None;
         if let Some(rs) = &self.wgpu {
@@ -559,10 +565,14 @@ impl EffectcraftApp {
                 self.gpu = Some(g);
                 self.wgpu = Some(rs.clone());
             }
-            Ok(Err(e)) => log::info!("GPU compositor unavailable: {e}"),
+            Ok(Err(e)) => {
+                log::info!("GPU compositor unavailable: {e}");
+                self.session.accel_note = Some(format!("GPU compositor unavailable: {e}"));
+            }
             Err(e) => {
                 let reason = e.downcast_ref::<String>().map(String::as_str).or_else(|| e.downcast_ref::<&str>().copied()).unwrap_or("backend panicked");
                 log::warn!("GPU compositor setup failed; using CPU compositing: {reason}");
+                self.session.accel_note = Some(format!("GPU compositor setup failed: {reason}"));
             }
         }
     }
@@ -1373,7 +1383,7 @@ impl EffectcraftApp {
             self.session.poll_mask_track();
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
-        // Background tasks (Content-Aware Fill, Scene Edit Detection).
+        // Background tasks (Content-Aware Fill, Scene Edit Detection, imports).
         if !self.session.tasks.is_empty() {
             self.session.poll_jobs();
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -1441,10 +1451,13 @@ impl EffectcraftApp {
         panels::scriptui_view::sync_panels(self);
         panels::scriptui_view::show_windows(self, &ctx);
         panels::learn::coach(self, &ctx);
-        self.draw_toast(ui, full);
+        let lift = panels::media_panels::import_card(self, ui, full);
+        self.draw_toast(ui, full, lift);
     }
 
-    fn draw_toast(&mut self, ui: &mut egui::Ui, full: egui::Rect) {
+    /// The status message or the latest toast, bottom left (`lift` points higher while the
+    /// Importing card is there).
+    fn draw_toast(&mut self, ui: &mut egui::Ui, full: egui::Rect, lift: f32) {
         let now = ui.input(|i| i.time);
         let msg = if !self.ui.status.is_empty() {
             Some(self.ui.status.clone())
@@ -1453,11 +1466,12 @@ impl EffectcraftApp {
         };
         if let Some(m) = msg {
             let t = &self.tokens;
-            let galley = ui.painter().layout_no_wrap(m, Tokens::ui(12.0), t.text);
-            let r = egui::Rect::from_min_size(egui::pos2(full.min.x + 16.0, full.max.y - 44.0), galley.size() + egui::vec2(24.0, 14.0));
+            let galley = ui.painter().layout_no_wrap(m.clone(), Tokens::ui(12.0), t.text);
+            let r = egui::Rect::from_min_size(egui::pos2(full.min.x + 16.0, full.max.y - 44.0 - lift), galley.size() + egui::vec2(24.0, 14.0));
             ui.painter().rect_filled(r, 6.0, t.panel_bg);
             ui.painter().rect_stroke(r, 6.0, egui::Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
             ui.painter().galley(r.min + egui::vec2(12.0, 7.0), galley, t.text);
+            self.auto.add("toast", r, &m);
             let resp = ui.interact(r, egui::Id::new("toast"), egui::Sense::click());
             if resp.clicked() {
                 self.ui.status.clear();
@@ -1538,6 +1552,7 @@ impl eframe::App for EffectcraftApp {
         self.apply_gpu_failure(ctx);
         if !self.styled {
             theme::install(ctx, &self.tokens);
+            fit_window(ctx);
             self.styled = true;
             ctx.request_repaint();
         } else {
@@ -1591,6 +1606,39 @@ impl eframe::App for EffectcraftApp {
 /// Advance playback with the viewer's scale (called by the viewer panel each frame).
 pub(crate) fn tick_playback(app: &mut EffectcraftApp, ctx: &egui::Context, scale: f64) {
     app.advance_playback(ctx, scale);
+}
+
+/// Maximize a first window that doesn't fit the screen, which fits it to the space beside the
+/// taskbar or dock. The 1680 × 1020 window on a smaller screen is only shrunk to the monitor's
+/// size, so with its title bar it ran under the taskbar and cut menus off at the bottom of the
+/// screen (#269).
+fn fit_window(ctx: &egui::Context) {
+    let (monitor, window) = ctx.input(|i| (i.viewport().monitor_size, i.viewport().outer_rect.or(i.viewport().inner_rect)));
+    if let (Some(monitor), Some(window)) = (monitor, window)
+        && overflows_screen(window.size(), monitor)
+    {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+    }
+}
+
+/// Whether a window `size` leaves no room on a `monitor` for a taskbar or dock (points).
+fn overflows_screen(size: egui::Vec2, monitor: egui::Vec2) -> bool {
+    const TASKBAR: f32 = 64.0;
+    size.x > monitor.x || size.y > monitor.y - TASKBAR
+}
+
+#[cfg(test)]
+mod fit_window_tests {
+    use super::overflows_screen;
+    use egui::vec2;
+
+    #[test]
+    fn a_window_taller_than_the_screen_beside_its_taskbar_overflows() {
+        // The default window on a 1366 × 768 laptop (shrunk to the monitor) and on 1080p.
+        assert!(overflows_screen(vec2(1366.0, 799.0), vec2(1366.0, 768.0)));
+        assert!(overflows_screen(vec2(1680.0, 1051.0), vec2(1920.0, 1080.0)));
+        assert!(!overflows_screen(vec2(1680.0, 1051.0), vec2(2560.0, 1440.0)));
+    }
 }
 
 #[cfg(test)]
