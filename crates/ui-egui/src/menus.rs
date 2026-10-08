@@ -190,6 +190,35 @@ fn reveal_time_remap(app: &mut EffectcraftApp, params: &Value) {
     }
 }
 
+/// After Alt+Shift+P (A, S, R, T) the Timeline shows the property on each layer it keyed, as in
+/// After Effects: added to what a reveal shortcut shows, else with the layer's Transform twirled
+/// open, else alone like P.
+fn reveal_keyed(app: &mut EffectcraftApp, keyed: &Value, kind: &str) {
+    let layers: std::collections::BTreeSet<u64> = keyed.as_array().into_iter().flatten().filter_map(|k| k.get("layer").and_then(Value::as_u64)).collect();
+    let Some(comp) = app.session.active_comp() else { return };
+    let tl = &mut app.ui.timeline;
+    for id in layers {
+        let shown = tl.layer_reveal.get(&id).filter(|k| !k.is_empty()).cloned();
+        match shown {
+            Some(mut kinds) => {
+                if !kinds.iter().any(|k| k == kind) {
+                    kinds.push(kind.to_string());
+                    tl.layer_reveal.insert(id, kinds);
+                }
+            }
+            None if tl.open_layers.contains(&id) => {
+                if let Some(tr) = comp.layer(effectcraft_engine::project::LayerId(id)).and_then(|l| l.transform()) {
+                    tl.open_groups.insert(tr.uid);
+                }
+            }
+            None => {
+                tl.open_layers.insert(id);
+                tl.layer_reveal.insert(id, vec![kind.to_string()]);
+            }
+        }
+    }
+}
+
 /// The layers a reveal shortcut acts on: the selected ones, else every layer of the active comp.
 fn reveal_targets(app: &EffectcraftApp) -> Vec<u64> {
     if app.session.state.selected_layers.is_empty() {
@@ -314,7 +343,9 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
         return Ok(Value::Null);
     }
     if let Some(k) = id.strip_prefix("timeline.keyAt.") {
-        return run_engine(app, ctx, "keys.toggleTransform", json!({"prop": k}));
+        let r = run_engine(app, ctx, "keys.toggleTransform", json!({"prop": k}))?;
+        reveal_keyed(app, &r, k);
+        return Ok(r);
     }
     if let Some(k) = id.strip_prefix("timeline.revealAdd.") {
         reveal(app, k, now, true);
@@ -589,6 +620,8 @@ fn clipboard_note(s: &effectcraft_engine::Session) -> String {
         n(st.key_clipboard.iter().map(|c| c.keys.len()).sum(), "keyframe", "keyframes")
     } else if !st.effect_clipboard.is_empty() {
         n(st.effect_clipboard.len(), "effect", "effects")
+    } else if !st.contents_clipboard.is_empty() {
+        n(st.contents_clipboard.len(), "shape item", "shape items")
     } else if st.link_clipboard.is_some() {
         "EffectCraft: property links".into()
     } else {
@@ -1365,6 +1398,12 @@ fn mods_match(want: egui::Modifiers, got: egui::Modifiers) -> bool {
     want.command == got.command && want.shift == got.shift && want.alt == got.alt && (want.ctrl == got.ctrl || got.command && cfg!(not(target_os = "macos")))
 }
 
+/// Set (egui temp data) from a plain Spacebar press until its release while a tap would still
+/// run the Spacebar shortcut.
+fn space_tap_id() -> egui::Id {
+    egui::Id::new("spacebar-tap")
+}
+
 /// Dispatch keyboard shortcuts (skipped while typing in a text field).
 pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
     // Dialog cancellation owns Escape even when a text field has keyboard focus.
@@ -1389,12 +1428,17 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
         }
         return;
     }
+    // A mouse button down while Spacebar is held belongs to the Hand tool: its release won't
+    // preview.
+    if ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input() {
+        ctx.data_mut(|d| d.remove::<bool>(space_tap_id()));
+    }
     if ctx.egui_wants_keyboard_input() {
         return;
     }
     // Text editing in the viewer takes the clipboard events itself.
     let clipboard = app.session.state.text_edit.is_none();
-    let events: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
+    let events: Vec<(egui::Key, egui::Modifiers, bool)> = ctx.input(|i| {
         // The windowing layer turns Ctrl+C / Ctrl+X / Ctrl+V into clipboard events instead of
         // key presses: map them back to the keys (with the modifiers held) so Edit ▸ Copy, Cut,
         // Paste and their variants (Ctrl+Alt+C…) run.
@@ -1405,11 +1449,12 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
                 egui::Event::Key { key, pressed: true, modifiers, repeat, .. }
                     if !*repeat || matches!(key, egui::Key::PageUp | egui::Key::PageDown | egui::Key::ArrowLeft | egui::Key::ArrowRight) =>
                 {
-                    Some((*key, *modifiers))
+                    Some((*key, *modifiers, true))
                 }
-                egui::Event::Copy if clipboard => Some((egui::Key::C, held)),
-                egui::Event::Cut if clipboard => Some((egui::Key::X, held)),
-                egui::Event::Paste(_) if clipboard => Some((egui::Key::V, held)),
+                egui::Event::Key { key: egui::Key::Space, pressed: false, .. } => Some((egui::Key::Space, egui::Modifiers::NONE, false)),
+                egui::Event::Copy if clipboard => Some((egui::Key::C, held, true)),
+                egui::Event::Cut if clipboard => Some((egui::Key::X, held, true)),
+                egui::Event::Paste(_) if clipboard => Some((egui::Key::V, held, true)),
                 _ => None,
             })
             .collect()
@@ -1418,7 +1463,20 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
         return;
     }
     let binds = bindings(&app.session);
-    for (key, mods) in events {
+    for (key, mods, pressed) in events {
+        // Plain Spacebar runs its shortcut (Play Current Preview) on the release: held, it is
+        // the Hand tool (After Effects), and a drag with it must not start or stop playback.
+        if key == egui::Key::Space && (!pressed || !mods.any()) {
+            if pressed {
+                if app.dialog.is_none() {
+                    ctx.data_mut(|d| d.insert_temp(space_tap_id(), true));
+                }
+                continue;
+            }
+            if !ctx.data_mut(|d| d.remove_temp::<bool>(space_tap_id())).unwrap_or(false) {
+                continue;
+            }
+        }
         // Escape closes dialogs.
         if key == egui::Key::Escape && app.dialog.is_some() {
             // Escape while recording a shortcut cancels the recording, not the editor.
@@ -1491,6 +1549,18 @@ pub fn menu_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
     {
         app.ui.status = e;
     }
+}
+
+/// The entries of top-level menu `name` (the Effect menu is the Effect Controls panel's context
+/// menu); returns the chosen command and its params.
+pub(crate) fn menu_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, name: &str) -> Option<(String, Value)> {
+    let mut clicked = None;
+    if let Some(MenuNode::Submenu { children, .. }) =
+        effectcraft_engine::menus::menu_bar().iter().find(|n| matches!(n, MenuNode::Submenu { label, .. } if label == name))
+    {
+        menu_nodes(app, ui, children, &mut clicked);
+    }
+    clicked.map(|(id, params)| (id, if params.is_null() { json!({}) } else { params }))
 }
 
 fn menu_nodes(app: &mut EffectcraftApp, ui: &mut egui::Ui, nodes: &[MenuNode], clicked: &mut Option<(String, Value)>) {

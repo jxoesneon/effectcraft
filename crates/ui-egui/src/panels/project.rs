@@ -2,8 +2,9 @@
 //! search, item list with columns (Name, Label, then the visible optional columns: Type, Size,
 //! Media Duration, Frame Rate, File Path, Comment — shown or hidden from the header's context
 //! menu), folders (drag items into and out of them), renaming (Enter, or double-click the name),
-//! the label colour picker, and the bottom bar (interpret, new folder, new comp, bit depth,
-//! delete). Edits are `project.*` engine commands, so they are undoable.
+//! the label colour picker, and the bottom bar (interpret, new folder, new comp: click, or drop
+//! items on it for a comp from them, bit depth, delete). Edits are engine commands, so they are
+//! undoable.
 
 use std::sync::{Arc, Mutex};
 
@@ -174,6 +175,12 @@ fn fit(r: Rect, w: f32, h: f32) -> Rect {
     Rect::from_center_size(r.center(), vec2(w * s, h * s))
 }
 
+/// A scroll bar thumb's length on a `track` long: the share of `content` in view, at least 16
+/// points but never longer than the track (a panel only a few points tall still draws, #231).
+fn thumb_len(track: f32, visible: f32, content: f32) -> f32 {
+    (track * visible / content).max(16.0).min(track).max(0.0)
+}
+
 /// An inline text edit in progress: (item, field `name`|`comment`, text).
 type Editing = (u64, String, String);
 fn edit_id() -> egui::Id {
@@ -323,9 +330,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let list = Rect::from_min_max(pos2(rect.min.x, hdr.max.y), pos2(rect.max.x, rect.max.y - footer_h));
     let lp = p.with_clip_rect(list);
     // The list's empty area (under the rows and the scroll bar, which take their own clicks):
-    // a double-click imports, as in After Effects (File ▸ Import ▸ File...).
-    let empty = ui.interact(list, egui::Id::new("proj-empty"), Sense::click());
-    app.auto.add("project.empty", list, "Double-click to import files");
+    // a click deselects, a drag draws a selection box, a double-click imports, as in After
+    // Effects (File ▸ Import ▸ File...).
+    let empty = ui.interact(list, egui::Id::new("proj-empty"), Sense::click_and_drag());
+    app.auto.add("project.empty", list, "Double-click to import files; drag to select items");
     if overflow > 0.0 && ui.rect_contains_pointer(list) {
         let (dx, dy, shift) = ui.input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y, i.modifiers.shift));
         let d = if dx.abs() > 0.0 {
@@ -339,7 +347,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     if overflow > 0.0 {
         let track = Rect::from_min_max(pos2(opt_x0, list.max.y - 5.0), pos2(rect.max.x - 4.0, list.max.y - 1.0));
-        let tw = (track.width() * track.width() / (track.width() + overflow)).max(16.0);
+        let tw = thumb_len(track.width(), track.width(), track.width() + overflow);
         let thumb = Rect::from_min_size(pos2(track.min.x + (track.width() - tw) * (hscroll / overflow), track.min.y), vec2(tw, track.height()));
         let sresp = ui.interact(track.expand2(vec2(0.0, 2.0)), egui::Id::new("proj-hscroll"), Sense::drag());
         p.rect_filled(track, 2.0, t.field_bg);
@@ -395,7 +403,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let scroll = app.ui.project_scroll;
     if max_scroll > 0.0 {
         let track = Rect::from_min_max(pos2(rect.max.x - 6.0, list.min.y + 1.0), pos2(rect.max.x - 2.0, list.max.y - 7.0));
-        let th = (track.height() * list.height() / content_h).clamp(16.0, track.height());
+        let th = thumb_len(track.height(), list.height(), content_h);
         let thumb = Rect::from_min_size(pos2(track.min.x, track.min.y + (track.height() - th) * (scroll / max_scroll)), vec2(track.width(), th));
         let vresp = ui.interact(track.expand2(vec2(2.0, 0.0)), egui::Id::new("proj-vscroll"), Sense::drag());
         p.rect_filled(thumb, 2.0, if vresp.hovered() || vresp.dragged() { t.text_dim } else { t.text_faint });
@@ -692,6 +700,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 _ => app.ui.status = "Interpret Footage: select a footage item".into(),
             }
         }
+        // Items dropped on Create a new Composition: New Comp from Selection with them (After
+        // Effects; several items ask how in its dialog).
+        if id == "newComp"
+            && let Some(DragPayload::Item(iid)) = egui::DragAndDrop::payload::<DragPayload>(&ctx).as_deref()
+            && ui.rect_contains_pointer(r)
+        {
+            p.rect_stroke(r, 4.0, Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
+            if ctx.input(|i| i.pointer.any_released()) {
+                if !app.session.state.project_selection.contains(&ItemId(*iid)) {
+                    app.session.state.project_selection = vec![ItemId(*iid)];
+                }
+                actions.push(("file.newCompFromSelection".into(), json!({})));
+                egui::DragAndDrop::clear_payload(&ctx);
+            }
+        }
         x += 26.0;
     }
     let depth = app.session.project.settings.bit_depth.label();
@@ -717,6 +740,41 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     app.auto.add("project.delete", tr, "Delete");
     if empty.double_clicked() {
         actions.push(("file.import".into(), json!({})));
+    }
+    // Selection box over the rows it touches (#203); Shift or Cmd/Ctrl adds to the selection.
+    let adding = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+    if empty.clicked() && !adding {
+        app.session.state.project_selection.clear();
+    }
+    let box_id = egui::Id::new("proj-marquee");
+    if let (Some(start), Some(end)) = (ctx.input(|i| i.pointer.press_origin()), empty.interact_pointer_pos())
+        && empty.dragged()
+    {
+        let b = Rect::from_two_pos(start, end).intersect(list);
+        lp.rect_filled(b, 0.0, t.accent.gamma_multiply(0.12));
+        lp.rect_stroke(b, 0.0, Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
+        ctx.data_mut(|d| d.insert_temp(box_id, b));
+    }
+    if empty.drag_stopped()
+        && let Some(b) = ctx.data(|d| d.get_temp::<Rect>(box_id))
+    {
+        ctx.data_mut(|d| d.remove::<Rect>(box_id));
+        // Rows sit at fixed heights from the top of the scrolled list.
+        let top = list.min.y - app.ui.project_scroll;
+        let picked = rows.iter().enumerate().filter(|(i, _)| {
+            let y = top + *i as f32 * ROW_H;
+            y < b.max.y && y + ROW_H > b.min.y
+        });
+        let picked: Vec<ItemId> = picked.map(|(_, (id, _))| *id).collect();
+        let sel = &mut app.session.state.project_selection;
+        if !adding {
+            sel.clear();
+        }
+        for id in picked {
+            if !sel.contains(&id) {
+                sel.push(id);
+            }
+        }
     }
     for (id, params) in actions {
         if let Err(e) = crate::menus::invoke(app, &ctx, &id, params) {

@@ -397,7 +397,7 @@ fn aux_views(
             _ => {
                 let opts = effectcraft_engine::render::RenderOpts { scale, view: comp.has_3d().then_some(cam), draft: true, ..Default::default() };
                 let img = app.session.render(cid, t, opts);
-                let tex = ctx.load_texture(format!("viewer-aux-{i}"), crate::frames::to_color_image(&img), egui::TextureOptions::LINEAR);
+                let tex = crate::frames::load_fitted(&ctx, format!("viewer-aux-{i}"), crate::frames::to_color_image(&img), egui::TextureOptions::LINEAR);
                 ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
                 tex
             }
@@ -459,7 +459,7 @@ fn locked_pane(app: &mut EffectcraftApp, ui: &mut egui::Ui, full: Rect, bg: Colo
                 dc.apply(&mut px);
                 ci = egui::ColorImage::new(ci.size, px.into_iter().map(|a| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3])).collect());
             }
-            let tex = ctx.load_texture("viewer-locked", ci, egui::TextureOptions::LINEAR);
+            let tex = crate::frames::load_fitted(&ctx, "viewer-locked", ci, egui::TextureOptions::LINEAR);
             ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
             tex
         }
@@ -909,10 +909,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         // becomes the target, using the same visible/unlocked hit test as left-click.
         pick(app, &ectx, map.to_comp(pos), false);
         let point = map.to_comp(pos);
-        let hits: Vec<(u64, String)> = selectable_layers(&comp, time)
-            .filter(|l| layer_quad(&ectx, l).is_some_and(|(_, q, _)| point_in_quad(point, &q)))
-            .map(|l| (l.id.0, l.name.clone()))
-            .collect();
+        let hits: Vec<(u64, String)> = layers_at(&ectx, point).map(|l| (l.id.0, l.name.clone())).collect();
         ui.data_mut(|d| d.insert_temp(menu_hits_id, hits));
     }
     let context_layers: Vec<u64> =
@@ -994,7 +991,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     app.ui.viewer.interacting = resp.dragged();
     let mods = ui.input(|i| i.modifiers);
-    let space_pan = ui.input(|i| i.key_down(egui::Key::Space)) && !ctx.egui_wants_keyboard_input();
+    let space_pan = super::space_hand(&ctx);
     // Pen tool: each press places a vertex (dragging pulls Bezier tangents); pressing on the
     // first vertex closes the path.
     if app.ui.tool == Tool::Pen
@@ -1657,8 +1654,9 @@ fn draw_rigs(app: &mut EffectcraftApp, painter: &egui::Painter, map: &ViewerMap,
 
 /// Pen tool press at `pos`: continue the path in progress (pressing its first vertex closes it),
 /// add a vertex on a visible path's segment, or start a new path: a mask on the selected
-/// footage/solid layer, a shape path (Shape n group with Fill and Stroke) on the selected shape
-/// layer, or a new shape layer when nothing is selected. The placed point snaps.
+/// footage/solid layer (or shape layer, with Tool Creates Mask), a shape path (Shape n group with
+/// the Tools bar's Fill and Stroke) on the selected shape layer, or a new shape layer when
+/// nothing is selected. The placed point snaps.
 fn pen_press(app: &mut EffectcraftApp, ui: &mut egui::Ui, ectx: &EvalCtx, map: &ViewerMap, paths: &[ov::PathInfo], pos: Pos2, mods: egui::Modifiers) {
     use effectcraft_engine::project::LayerSource;
     let gid = egui::Id::new("viewer-gesture");
@@ -1705,7 +1703,7 @@ fn pen_press(app: &mut EffectcraftApp, ui: &mut egui::Ui, ectx: &EvalCtx, map: &
         .find(|id| ectx.comp.layer(*id).is_some_and(|l| !l.switches.locked && (l.masks().is_some() || matches!(l.source, LayerSource::Shape))));
     let layer = target.and_then(|id| ectx.comp.layer(id));
     let (lid, uid, inv) = match layer {
-        Some(l) if !matches!(l.source, LayerSource::Shape) => {
+        Some(l) if !matches!(l.source, LayerSource::Shape) || app.session.state.shape_tool.creates_mask => {
             let Some(inv) = l2c(ectx, l).0.inverse() else { return };
             let lp = inv.apply(gv2(c[0], c[1]));
             let Ok(v) = app.session.execute("mask.new", json!({"layer": l.id.0, "vertices": [[lp.x, lp.y]]})) else { return };
@@ -1715,23 +1713,13 @@ fn pen_press(app: &mut EffectcraftApp, ui: &mut egui::Ui, ectx: &EvalCtx, map: &
         Some(l) => {
             let Some(inv) = l2c(ectx, l).0.inverse() else { return };
             let lp = inv.apply(gv2(c[0], c[1]));
-            let fill = app.ui.fill_color;
-            let stroke = app.ui.stroke_color;
-            let r = app.session.execute(
-                "shape.newPath",
-                json!({"layer": l.id.0, "vertices": [[lp.x, lp.y]], "space": "layer", "fill": [fill[0], fill[1], fill[2]], "stroke": [stroke[0], stroke[1], stroke[2]], "strokeWidth": app.ui.stroke_width}),
-            );
+            let r = app.session.execute("shape.newPath", json!({"layer": l.id.0, "vertices": [[lp.x, lp.y]], "space": "layer"}));
             let Some(path) = r.ok().and_then(|v| v["path"].as_u64()) else { return };
             (l.id, path, inv)
         }
         None => {
             // A new shape layer at the comp centre (unrotated: comp → layer is a translation).
-            let fill = app.ui.fill_color;
-            let stroke = app.ui.stroke_color;
-            let r = app.session.execute(
-                "shape.newPath",
-                json!({"vertices": [c], "space": "comp", "fill": [fill[0], fill[1], fill[2]], "stroke": [stroke[0], stroke[1], stroke[2]], "strokeWidth": app.ui.stroke_width}),
-            );
+            let r = app.session.execute("shape.newPath", json!({"vertices": [c], "space": "comp"}));
             let Some(v) = r.ok() else { return };
             let (Some(l), Some(path)) = (v["layer"].as_u64(), v["path"].as_u64()) else { return };
             let inv = Mat3::translate(gv2(-(ectx.comp.width as f64) / 2.0, -(ectx.comp.height as f64) / 2.0));
@@ -1754,17 +1742,29 @@ pub(crate) fn selectable_layers(comp: &Comp, time: Tick) -> impl Iterator<Item =
         .filter(move |l| l.is_active_at(time) && l.switches.video && !l.switches.locked && !l.is_camera() && !l.is_light() && (!any_solo || l.switches.solo))
 }
 
-/// Topmost selectable layer under a comp point.
-pub(crate) fn layer_at<'a>(ectx: &EvalCtx<'a>, cpt: [f64; 2]) -> Option<&'a Layer> {
-    selectable_layers(ectx.comp, ectx.time).find(|l| layer_quad(ectx, l).is_some_and(|(_, q, _)| point_in_quad(cpt, &q)))
+/// Selectable layers under a comp point, front to back.
+fn layers_at<'a, 'b>(ectx: &'b EvalCtx<'a>, cpt: [f64; 2]) -> impl Iterator<Item = &'a Layer> + 'b {
+    selectable_layers(ectx.comp, ectx.time).filter(move |l| layer_quad(ectx, l).is_some_and(|(_, q, _)| point_in_quad(cpt, &q)))
 }
 
-/// Topmost layer under a comp point (selects it; shift toggles). Returns the hit layer.
+/// Topmost selectable layer under a comp point.
+pub(crate) fn layer_at<'a>(ectx: &EvalCtx<'a>, cpt: [f64; 2]) -> Option<&'a Layer> {
+    layers_at(ectx, cpt).next()
+}
+
+/// The layer a press at a comp point acts on, selected (Shift toggles the topmost layer). As in
+/// After Effects, a selected layer under the point comes before the layers in front of it, so it
+/// can be dragged where they cover it; otherwise the topmost layer (#230).
 pub(crate) fn pick(app: &mut EffectcraftApp, ectx: &EvalCtx, cpt: [f64; 2], toggle: bool) -> Option<LayerId> {
-    let hit = layer_at(ectx, cpt).map(|l| l.id)?;
     if toggle {
+        let hit = layer_at(ectx, cpt)?.id;
         let _ = app.session.execute("layer.select", json!({"layers": [hit.0], "toggle": true}));
-    } else if !app.session.state.selected_layers.contains(&hit) {
+        return Some(hit);
+    }
+    let selected = &app.session.state.selected_layers;
+    let hits: Vec<LayerId> = layers_at(ectx, cpt).map(|l| l.id).collect();
+    let hit = *hits.iter().find(|id| selected.contains(id)).or(hits.first())?;
+    if !selected.contains(&hit) {
         let _ = app.session.execute("layer.select", json!({"layers": [hit.0]}));
     }
     Some(hit)
@@ -1790,13 +1790,14 @@ fn create_shape(app: &mut EffectcraftApp, tool: Tool, a: [f64; 2], b: [f64; 2], 
         Tool::Polygon => "polygon",
         _ => "star",
     };
-    // A non-shape layer selected and "creates mask": add a mask instead.
+    // A footage, solid or other non-shape layer selected, or a shape layer with Tool Creates
+    // Mask: a mask on it instead.
+    let creates_mask = app.session.state.shape_tool.creates_mask;
     let sel = app.session.state.selected_layers.first().copied();
     let sel_layer = sel.and_then(|id| app.session.active_comp().and_then(|c| c.layer(id)).cloned());
     if let Some(l) = sel_layer
-        && !matches!(l.source, effectcraft_engine::project::LayerSource::Shape)
         && l.source.is_av()
-        && matches!(kind, "rect" | "ellipse")
+        && (creates_mask || !matches!(l.source, effectcraft_engine::project::LayerSource::Shape))
     {
         // Mask in layer space: invert the layer transform.
         let comp = app.session.active_comp_arc();
@@ -1812,19 +1813,18 @@ fn create_shape(app: &mut EffectcraftApp, tool: Tool, a: [f64; 2], b: [f64; 2], 
             let inv = l2c(&ectx, &l).0.inverse().unwrap_or(Mat3::IDENTITY);
             let p0 = inv.apply(gv2(cx - w / 2.0, cy - h / 2.0));
             let p1 = inv.apply(gv2(cx + w / 2.0, cy + h / 2.0));
-            let _ = app.session.execute(
-                "layer.addMask",
-                json!({"layer": l.id.0, "shape": if kind == "ellipse" { "ellipse" } else { "rect" }, "rect": [p0.x.min(p1.x), p0.y.min(p1.y), (p1.x - p0.x).abs(), (p1.y - p0.y).abs()]}),
-            );
+            let rect = [p0.x.min(p1.x), p0.y.min(p1.y), (p1.x - p0.x).abs(), (p1.y - p0.y).abs()];
+            if let Err(e) = app.session.execute("layer.addMask", json!({"layer": l.id.0, "shape": kind, "rect": rect})) {
+                app.ui.status = e.to_string();
+            }
             return;
         }
     }
-    let fill = app.ui.fill_color;
-    let stroke = app.ui.stroke_color;
-    let _ = app.session.execute(
-        "layer.newShape",
-        json!({"kind": kind, "size": [w, h], "position": [cx, cy], "fill": [fill[0], fill[1], fill[2]], "stroke": [stroke[0], stroke[1], stroke[2]], "strokeWidth": app.ui.stroke_width}),
-    );
+    // Into the selected shape layer's Contents as a new group (as in After Effects), else a new
+    // shape layer; painted with the Tools bar's Fill and Stroke.
+    if let Err(e) = app.session.execute("shape.newShape", json!({"kind": kind, "size": [w, h], "position": [cx, cy]})) {
+        app.ui.status = e.to_string();
+    }
 }
 
 fn empty_state(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
@@ -1912,12 +1912,15 @@ fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames:
     let opts = zoom_texture_options(smooth);
     match img {
         FrameImage::Cpu(img) => {
+            // Frames wider or taller than the GPU's texture limit go up averaged down (#201).
+            let max = crate::frames::max_texture_side(ctx);
+            let fitted = crate::frames::fit_texture((*img).clone(), max);
             match &mut app.viewer_tex {
-                Some((tex, k)) if tex.size() == img.size => {
-                    tex.set((*img).clone(), opts);
+                Some((tex, k)) if tex.size() == fitted.size => {
+                    tex.set(fitted, opts);
                     *k = key;
                 }
-                _ => app.viewer_tex = Some((ctx.load_texture("viewer-frame", (*img).clone(), opts), key)),
+                _ => app.viewer_tex = Some((ctx.load_texture("viewer-frame", fitted, opts), key)),
             }
             app.viewer_shown = app.viewer_tex.as_ref().map(|(t, k)| (t.id(), *k));
             app.viewer_image = Some(img);

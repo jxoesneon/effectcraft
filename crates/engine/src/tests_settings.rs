@@ -487,11 +487,25 @@ fn memory_tick_never_waits_for_the_system() {
     }
 }
 
+/// Settings ▸ Startup & Repair ▸ Window Graphics takes `auto` or `gl` (#243).
+#[test]
+fn window_graphics_is_validated() {
+    let mut s = Session::default();
+    assert_eq!(s.prefs.startup.window_graphics, "auto");
+    s.execute("prefs.set", json!({"key": "startup.windowGraphics", "value": "gl"})).unwrap();
+    for bad in [json!("vulkan"), json!(true)] {
+        assert!(s.execute("prefs.set", json!({"key": "startup.windowGraphics", "value": bad})).is_err());
+    }
+    assert_eq!(s.prefs.startup.window_graphics, "gl");
+    assert_eq!(Prefs::from_json(r#"{"startup":{"windowGraphics":"dx9"}}"#).startup.window_graphics, "auto");
+}
+
 #[test]
 fn interface_language_is_validated_persisted_and_backward_compatible() {
     let store = Arc::new(MemoryConfig::default());
     let mut s = Session { config: Some(store.clone()), ..Default::default() };
-    assert_eq!(s.prefs.general.language, "en");
+    assert_eq!(s.prefs.general.language, "system", "Match System by default (#229)");
+    s.execute("prefs.set", json!({"key": "general.language", "value": "en"})).unwrap();
     s.execute("prefs.set", json!({"key": "general.language", "value": "ja"})).unwrap();
     assert_eq!(s.execute("prefs.get", json!({"key": "general.language"})).unwrap(), json!("ja"));
     let saved = store.read(PREFS_FILE).unwrap();
@@ -504,9 +518,10 @@ fn interface_language_is_validated_persisted_and_backward_compatible() {
     reloaded.load_settings();
     assert_eq!(reloaded.prefs.general.language, "ja");
     reloaded.execute("prefs.reset", json!({"page": "general"})).unwrap();
-    assert_eq!(reloaded.prefs.general.language, "en");
-    assert_eq!(Prefs::from_json(r#"{"general":{"undoLevels":17}}"#).general.language, "en");
-    assert_eq!(Prefs::from_json(r#"{"general":{"language":"unknown"}}"#).general.language, "en");
+    assert_eq!(reloaded.prefs.general.language, "system");
+    assert_eq!(Prefs::from_json(r#"{"general":{"undoLevels":17}}"#).general.language, "system");
+    assert_eq!(Prefs::from_json(r#"{"general":{"language":"unknown"}}"#).general.language, "system");
+    assert_eq!(Prefs::from_json(r#"{"general":{"language":"en"}}"#).general.language, "en", "a chosen language stays");
 }
 
 #[test]

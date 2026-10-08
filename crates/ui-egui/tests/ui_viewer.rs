@@ -3,11 +3,13 @@
 //! (egui_kittest, UI logic only).
 
 use effectcraft_engine::Session;
+use effectcraft_engine::commands::shape_tool::PaintKind;
 use effectcraft_engine::project::LayerId;
 use effectcraft_ui_egui::EffectcraftApp;
 use effectcraft_ui_egui::state::Tool;
 use egui::{Event, Pos2, Rect, pos2, vec2};
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use serde_json::json;
 
 fn app() -> EffectcraftApp {
@@ -134,6 +136,32 @@ fn viewer_click_ignores_inactive_solo_layers() {
     assert_eq!(h.state().session.state.selected_layers, vec![back]);
 }
 
+/// A selected layer under the pointer takes the press before the layers in front of it, as in
+/// After Effects: it stays selected and a drag moves it. With none selected there, the topmost
+/// layer does (#230).
+#[test]
+fn viewer_press_prefers_a_selected_layer_under_the_pointer() {
+    let mut h = selection_harness();
+    let comp = h.state().session.active_comp().unwrap();
+    let (front, back) = (comp.layers[0].id, comp.layers[1].id);
+    h.state_mut().session.execute("layer.select", json!({"layers": [back.0]})).unwrap();
+    h.run_steps(3);
+    let at = screen(&h, [320.0, 180.0]);
+    click(&mut h, at);
+    assert_eq!(h.state().session.state.selected_layers, vec![back], "a click keeps the selected layer behind");
+    h.run_steps(40);
+    let (front0, back0) = (position_and_anchor(&h, front).0, position_and_anchor(&h, back).0);
+    drag(&mut h, at, at + vec2(60.0, 0.0));
+    assert_eq!(h.state().session.state.selected_layers, vec![back]);
+    assert_eq!(position_and_anchor(&h, front).0, front0, "the layer in front stays");
+    assert!(position_and_anchor(&h, back).0[0] > back0[0] + 10.0, "the selected layer behind moves");
+    h.state_mut().session.execute("edit.deselectAll", json!({})).unwrap();
+    h.run_steps(40);
+    let at = screen(&h, [300.0, 180.0]);
+    click(&mut h, at);
+    assert_eq!(h.state().session.state.selected_layers, vec![front], "nothing selected: the topmost layer");
+}
+
 #[test]
 fn bottom_bar_in_after_effects_order() {
     let h = harness();
@@ -219,6 +247,105 @@ fn layer_drag_snaps_to_comp_centre_and_ctrl_disables() {
     drag(&mut h, from, to);
     let p = pos(&h);
     assert!((p[0] - 320.0).abs() > 1.0, "{p:?}");
+}
+
+/// With a shape layer selected the Rectangle tool draws a new group into its Contents (After
+/// Effects' behaviour); with nothing selected it draws a new shape layer (#227).
+#[test]
+fn shape_tool_draws_into_the_selected_shape_layer() {
+    let mut h = harness();
+    let l = h.state_mut().session.execute("layer.newShape", json!({"kind": "rect", "size": [100, 100], "position": [320, 180]})).unwrap()["layer"]
+        .as_u64()
+        .unwrap();
+    h.state_mut().ui.tool = Tool::Rectangle;
+    h.run_steps(2);
+    let n0 = h.state().session.active_comp().unwrap().layers.len();
+    let (a, b) = (screen(&h, [100.0, 100.0]), screen(&h, [200.0, 160.0]));
+    drag(&mut h, a, b);
+    let comp = h.state().session.active_comp().unwrap().clone();
+    assert_eq!(comp.layers.len(), n0, "no new layer");
+    let contents = comp.layer(LayerId(l)).unwrap().props.sub("contents").unwrap().clone();
+    let names: Vec<&str> = contents.groups().map(|g| g.name.as_str()).collect();
+    assert_eq!(names, ["Rectangle 2", "Rectangle 1"]);
+    // Placed where it was drawn (centred near comp (150, 130)), in the layer's space: the layer
+    // sits at the comp centre.
+    let g = contents.groups().next().unwrap();
+    let at = g.sub("transform").unwrap().get("position").unwrap().value.components();
+    assert!((at[0] + 170.0).abs() < 8.0 && (at[1] + 50.0).abs() < 8.0, "{at:?}");
+    // Nothing selected: a new shape layer.
+    h.state_mut().session.execute("edit.deselectAll", json!({})).unwrap();
+    let (a, b) = (screen(&h, [400.0, 250.0]), screen(&h, [500.0, 300.0]));
+    drag(&mut h, a, b);
+    let comp = h.state().session.active_comp().unwrap();
+    assert_eq!(comp.layers.len(), n0 + 1);
+    assert!(matches!(comp.layers[0].source, effectcraft_engine::project::LayerSource::Shape));
+    assert_ne!(comp.layers[0].id, LayerId(l));
+}
+
+/// With a shape layer selected and a shape tool active, the Tools bar's Tool Creates Mask makes
+/// the tool draw a mask on the layer (and hides Fill and Stroke); Tool Creates Shape draws
+/// shapes again (#227).
+#[test]
+fn tool_creates_mask_draws_a_mask_on_the_selected_shape_layer() {
+    let mut h = harness();
+    let l = h.state_mut().session.execute("layer.newShape", json!({"kind": "rect", "size": [100, 100], "position": [320, 180]})).unwrap()["layer"]
+        .as_u64()
+        .unwrap();
+    h.state_mut().ui.tool = Tool::Star;
+    h.run_steps(2);
+    assert!(h.state().auto.find("header.fill").is_some());
+    let at = rect(&h, "header.createsMask").center();
+    click(&mut h, at);
+    assert!(h.state().session.state.shape_tool.creates_mask);
+    assert!(h.state().auto.find("header.fill").is_none(), "no Fill or Stroke for masks");
+    let (a, b) = (screen(&h, [100.0, 100.0]), screen(&h, [200.0, 200.0]));
+    drag(&mut h, a, b);
+    let layer = h.state().session.active_comp().unwrap().layer(LayerId(l)).unwrap().clone();
+    let masks = layer.props.sub("masks").unwrap();
+    assert_eq!(masks.groups().count(), 1, "a mask");
+    assert_eq!(masks.groups().next().unwrap().get("path").unwrap().value.as_path().unwrap().vertices.len(), 10, "a star");
+    assert_eq!(layer.props.sub("contents").unwrap().groups().count(), 1, "no new shape");
+    let at = rect(&h, "header.createsShape").center();
+    click(&mut h, at);
+    assert!(!h.state().session.state.shape_tool.creates_mask);
+}
+
+/// Clicking the word "Fill" opens Fill Options: a radial gradient in Multiply at 40% paints the
+/// next shape drawn (#227).
+#[test]
+fn fill_options_paint_the_next_shape() {
+    let mut h = harness();
+    h.state_mut().ui.tool = Tool::Ellipse;
+    h.run_steps(2);
+    let at = rect(&h, "header.fillOptions").center();
+    click(&mut h, at);
+    let at = rect(&h, "header.fillOptions.radial").center();
+    click(&mut h, at);
+    let at = rect(&h, "header.fillOptions.blend").center();
+    click(&mut h, at);
+    let at = h.get_by_label("Multiply").rect().center();
+    click(&mut h, at);
+    let at = rect(&h, "header.fillOptions.opacity").center();
+    click(&mut h, at);
+    h.input_mut().events.push(Event::Text("40".into()));
+    h.step();
+    h.input_mut().events.push(Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    h.run_steps(2);
+    let fill = h.state().session.state.shape_tool.fill.clone();
+    assert_eq!((fill.kind, fill.blend, fill.opacity), (PaintKind::Radial, effectcraft_engine::color::BlendMode::Multiply, 40.0));
+    h.input_mut().events.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    h.run_steps(3);
+    assert!(h.state().auto.find("header.fillOptions.radial").is_none(), "closed");
+    let (a, b) = (screen(&h, [100.0, 100.0]), screen(&h, [220.0, 160.0]));
+    drag(&mut h, a, b);
+    let layer = h.state().session.active_comp().unwrap().layers[0].clone();
+    let g = layer.props.sub("contents").unwrap().groups().next().unwrap().sub("contents").unwrap().clone();
+    assert_eq!(g.groups().map(|x| x.match_id.as_str()).collect::<Vec<_>>(), ["ellipse", "gfill"]);
+    let gfill = g.groups().find(|x| x.match_id == "gfill").unwrap();
+    let multiply = effectcraft_engine::color::BlendMode::ALL.iter().position(|m| *m == effectcraft_engine::color::BlendMode::Multiply).unwrap() as u32;
+    assert_eq!(gfill.get("type").unwrap().value, effectcraft_keyframe::Value::Enum(1));
+    assert_eq!(gfill.get("blend").unwrap().value, effectcraft_keyframe::Value::Enum(multiply));
+    assert_eq!(gfill.get("opacity").unwrap().value.as_f64(), 40.0);
 }
 
 #[test]
@@ -735,6 +862,67 @@ fn middle_and_hand_drags_pan_the_viewer_and_the_pan_stays_after_release() {
     assert!((end[0] - after[0] + 50.0).abs() < 1.0 && (end[1] - after[1] + 30.0).abs() < 1.0, "{after:?} → {end:?}");
 }
 
+/// A Spacebar press or release (`repeat`: the keyboard's auto-repeat while it is held).
+fn space(h: &mut Harness<'_, EffectcraftApp>, pressed: bool, repeat: bool) {
+    h.input_mut().events.push(Event::Key { key: egui::Key::Space, physical_key: None, pressed, repeat, modifiers: Default::default() });
+    h.step();
+}
+
+/// #227: a Spacebar tap starts and stops the preview when it is released; held, Spacebar is the
+/// Hand tool, so a drag pans the viewer and neither starts nor stops the preview. Auto-repeat
+/// while it is held toggles nothing more, and a space typed in a text field doesn't preview.
+#[test]
+fn spacebar_taps_preview_and_held_spacebar_pans_the_viewer() {
+    let mut h = harness();
+    let playing = |h: &Harness<'_, EffectcraftApp>| h.state().playback.playing;
+    let tap = |h: &mut Harness<'_, EffectcraftApp>| {
+        space(h, true, false);
+        space(h, false, false);
+    };
+    space(&mut h, true, false);
+    assert!(!playing(&h), "the press alone doesn't play");
+    space(&mut h, false, false);
+    assert!(playing(&h), "the release does");
+    tap(&mut h);
+    assert!(!playing(&h), "another tap stops");
+    // Held with auto-repeat: one toggle, on the release.
+    space(&mut h, true, false);
+    for _ in 0..5 {
+        space(&mut h, true, true);
+    }
+    assert!(!playing(&h));
+    space(&mut h, false, false);
+    assert!(playing(&h));
+    tap(&mut h);
+
+    // Held and dragged: pans the viewer (the Box under the pointer stays), and plays nothing.
+    let box_pos = |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layers[0].props.prop("transform/position").unwrap().value.clone();
+    let (pos, before) = (box_pos(&h), h.state().ui.viewer.pan);
+    let c = rect(&h, "viewer.comp").center();
+    space(&mut h, true, false);
+    drag_with(&mut h, egui::PointerButton::Primary, c, c + vec2(80.0, 40.0));
+    space(&mut h, false, false);
+    let after = h.state().ui.viewer.pan;
+    assert!((after[0] - before[0] - 80.0).abs() < 1.0 && (after[1] - before[1] - 40.0).abs() < 1.0, "{before:?} → {after:?}");
+    assert_eq!(box_pos(&h), pos);
+    assert!(!playing(&h), "a Spacebar drag doesn't start the preview");
+    // Nor stop one.
+    tap(&mut h);
+    let c = rect(&h, "viewer.comp").center();
+    space(&mut h, true, false);
+    drag_with(&mut h, egui::PointerButton::Primary, c, c - vec2(30.0, 0.0));
+    space(&mut h, false, false);
+    assert!(playing(&h), "a Spacebar drag doesn't stop the preview");
+    tap(&mut h);
+    assert!(!playing(&h));
+
+    // In a text field Spacebar types.
+    let search = rect(&h, "timeline.search").center();
+    click(&mut h, search);
+    tap(&mut h);
+    assert!(!playing(&h), "a space typed in the Timeline search doesn't preview");
+}
+
 #[test]
 fn timeline_rows_drag_to_reorder_layers() {
     let mut h = harness();
@@ -1018,4 +1206,27 @@ fn handle_drags_scale_about_the_anchor_and_follow_the_pointer() {
     let path = [corner, screen(&h, [400.0, 230.0])];
     drag_path(&mut h, &path, egui::Modifiers::SHIFT);
     assert!(close(scale(&h), [162.5, 162.5]), "{:?}", scale(&h));
+}
+
+/// A comp wider than the GPU's texture limit at Full resolution shows its frame (averaged down
+/// into a texture the renderer accepts) instead of failing the upload (#201: 11000×2200).
+#[test]
+fn full_resolution_frames_wider_than_the_texture_limit_fit() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Wide", "width": 2400, "height": 400, "duration": 1})).unwrap();
+    s.execute("layer.newSolid", json!({"name": "Plate", "color": "#406080"})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    // (egui's font atlas needs 1024.)
+    h.input_mut().max_texture_side = Some(1024);
+    h.state_mut().ui.viewer.res = effectcraft_ui_egui::state::Resolution::Full;
+    let full = |h: &mut Harness<'_, EffectcraftApp>| h.state_mut().viewer_pixels().is_some_and(|px| px.size == [2400, 400]);
+    for _ in 0..400 {
+        h.step();
+        if full(&mut h) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(full(&mut h), "the full-size frame is shown (and stays readable): {:?}", h.state().ui.viewer.res);
+    assert_eq!(h.state().viewer_texture_size(), Some([800, 134]), "2400×400 averaged by 3");
 }

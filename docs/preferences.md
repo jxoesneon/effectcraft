@@ -29,7 +29,7 @@ Commands (CLI, MCP, control channel):
 
 ### Settings that change behaviour
 
-- `general.language`: interface language (`en` / `ja`), Settings ▸ General ▸ Language; menu labels change immediately. Native Japanese UI uses installed system fonts; the web host must supply a Japanese font.
+- `general.language`: interface language (`system` / `en` / `ja`), Settings ▸ General ▸ Language; menu labels change immediately. `system` (Match System, the default) follows the operating system's interface language where EffectCraft has a translation and is English otherwise; the browser build stays in English with it. Native Japanese UI uses installed system fonts; the web host must supply a Japanese font.
 - `general.undoLevels`: Levels of Undo
 - `general.pathPointSize`: Path Point and Handle Size
 - `general.recentItems`: Recent Projects Shown
@@ -38,6 +38,7 @@ Commands (CLI, MCP, control channel):
 - `general.defaultSpatialLinear`: Default Spatial Interpolation to Linear
 - `startup.showHomeOnLaunch`: Show Home Screen When Launching
 - `startup.offerCrashRecovery`: Offer to Open the Latest Auto-Save After a Crash
+- `startup.windowGraphics`: Window Graphics (`auto` / `gl`), what the desktop window draws with from the next launch. `auto` lets the platform pick (DirectX 12, Vulkan or Metal); `gl` uses OpenGL, with CPU compositing, for graphics drivers that crash with the others. A launch whose window never drew leaves a `launch-pending` marker in the settings folder, and the next launch switches to `gl` and says so (not on macOS, which has no OpenGL backend). `WGPU_BACKEND` overrides both.
 - `project.useTemplate`: New Project Loads Template
 - `project.templatePath`: Template Project
 - `autoSave.enabled`: Automatically Save Projects
