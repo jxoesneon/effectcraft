@@ -14,7 +14,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl python3-pip
+          sudo apt-get install -y curl python3-pip flatpak flatpak-builder
           pip3 install aiohttp tomlkit --break-system-packages || pip3 install aiohttp tomlkit
       - name: Vendor Cargo sources
         run: |
