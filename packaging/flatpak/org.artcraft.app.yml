@@ -10,7 +10,7 @@
 # For Flathub, replace the `dir` source with a `git` source pinned to a release tag and commit.
 id: org.artcraft.app
 runtime: org.freedesktop.Platform
-runtime-version: '24.08'
+runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
