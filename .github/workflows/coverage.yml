@@ -14,8 +14,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config libvulkan1 mesa-vulkan-drivers xvfb
       - name: Install llvm-cov
         run: cargo install cargo-llvm-cov
       - name: Verify Coverage Threshold
-        run: cargo llvm-cov --all-features --workspace --fail-under-lines 95
+        run: xvfb-run --auto-servernum cargo llvm-cov --all-features --workspace --fail-under-lines 95
