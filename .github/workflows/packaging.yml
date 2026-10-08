@@ -17,7 +17,7 @@ jobs:
           sudo apt-get install -y curl python3-pip flatpak flatpak-builder
           pip3 install aiohttp tomlkit --break-system-packages || pip3 install aiohttp tomlkit
           flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-          flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
       - name: Vendor Cargo sources
         run: |
           curl -fsSLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
