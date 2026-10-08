@@ -21,18 +21,11 @@ pub struct KeyframeTrack {
 
 impl KeyframeTrack {
     pub fn new(property: &str) -> Self {
-        Self {
-            property_name: property.to_string(),
-            keyframes: Vec::new(),
-        }
+        Self { property_name: property.to_string(), keyframes: Vec::new() }
     }
 
     pub fn insert_keyframe(&mut self, frame: u64, value: f32) {
-        self.keyframes.push(Keyframe {
-            frame,
-            value,
-            interpolation: InterpolationType::Bezier,
-        });
+        self.keyframes.push(Keyframe { frame, value, interpolation: InterpolationType::Bezier });
         self.keyframes.sort_by_key(|k| k.frame);
     }
 }

@@ -3,9 +3,15 @@ name = "effectcraft-ui-martensite"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Sovereign retained-mode motion graphics and VFX user interface for EffectCraft powered by Martensite"
+description = "Sovereign retained-mode, GPU-accelerated graphical user interface for EffectCraft powered by Martensite"
 
 [dependencies]
+effectcraft-engine = { workspace = true }
+effectcraft-model = { workspace = true }
+effectcraft-geom = { workspace = true }
+effectcraft-color = { workspace = true }
+effectcraft-time = { workspace = true }
+
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tracing.workspace = true

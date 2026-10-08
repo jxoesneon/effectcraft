@@ -92,6 +92,28 @@ pub enum EngineError {
 
 pub type Result<T> = std::result::Result<T, EngineError>;
 
+/// The application engine: project, commands, history and tool state.
+/// Named `Engine` so UIs (egui, Martensite, headless) refer to one type.
+pub type Engine = Session;
+
+/// Toolbox tool identity, in After Effects toolbar order. UI-agnostic so every front-end
+/// shares the canonical list; each UI maps it to its own presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tool {
+    Selection,
+    Hand,
+    Zoom,
+    Rotation,
+    PanBehind,
+    Shape,
+    Pen,
+    Type,
+    Brush,
+    CloneStamp,
+    Eraser,
+    RotoBrush,
+}
+
 /// Host services (file access) injected by the frontend.
 pub trait Services: Send + Sync {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
